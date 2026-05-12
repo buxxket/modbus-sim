@@ -33,16 +33,22 @@ type registerConfig struct {
 }
 
 type configManager struct {
-	path      string
-	mu        sync.RWMutex
-	holding   map[int]uint16
-	input     map[int]uint16
-	modTime   time.Time
-	lastCheck time.Time
+	path           string
+	mu             sync.RWMutex
+	holding        map[int]uint16
+	input          map[int]uint16
+	writtenHolding map[int]uint16
+	writtenInput   map[int]uint16
+	modTime        time.Time
+	lastCheck      time.Time
 }
 
 func newConfigManager(path string) (*configManager, error) {
-	mgr := &configManager{path: path}
+	mgr := &configManager{
+		path:           path,
+		writtenHolding: make(map[int]uint16),
+		writtenInput:   make(map[int]uint16),
+	}
 	if err := mgr.loadConfig(); err != nil {
 		return nil, err
 	}
@@ -93,6 +99,8 @@ func (m *configManager) refreshIfNeeded() {
 
 	m.holding = holding
 	m.input = input
+	m.writtenHolding = make(map[int]uint16)
+	m.writtenInput = make(map[int]uint16)
 	m.modTime = stat.ModTime()
 	log.Printf("Reloaded register config from %s", m.path)
 }
@@ -118,6 +126,8 @@ func (m *configManager) loadConfig() error {
 	m.mu.Lock()
 	m.holding = holding
 	m.input = input
+	m.writtenHolding = make(map[int]uint16)
+	m.writtenInput = make(map[int]uint16)
 	m.modTime = stat.ModTime()
 	m.lastCheck = time.Now()
 	m.mu.Unlock()
@@ -129,20 +139,47 @@ func (m *configManager) readRange(function uint8, register int, endRegister int)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	values := m.holding
+	config := m.holding
+	written := m.writtenHolding
 	if function == modbus.FuncCodeReadInputRegisters {
-		values = m.input
+		config = m.input
+		written = m.writtenInput
 	}
 
 	result := make([]uint16, 0, endRegister-register)
 	for addr := register; addr < endRegister; addr++ {
-		val, ok := values[addr]
+		var val uint16
+		var ok bool
+		if val, ok = written[addr]; !ok {
+			val, ok = config[addr]
+		}
 		if !ok {
 			return nil, false
 		}
 		result = append(result, val)
 	}
 	return result, true
+}
+
+func (m *configManager) writeRange(function uint8, register int, values []uint16) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	config := m.holding
+	written := m.writtenHolding
+	if function == modbus.FuncCodeReadInputRegisters {
+		config = m.input
+		written = m.writtenInput
+	}
+
+	for i, val := range values {
+		addr := register + i
+		if _, ok := config[addr]; !ok {
+			return false
+		}
+		written[addr] = val
+	}
+	return true
 }
 
 func buildRegisterMaps(cfg registerConfig) (map[int]uint16, map[int]uint16, error) {
@@ -326,6 +363,8 @@ func run() error {
 
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadInputRegisters, ReadHoldingRegisters) //note this is a hack
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadHoldingRegisters, ReadHoldingRegisters)
+	serv.RegisterFunctionHandler(modbus.FuncCodeWriteSingleRegister, WriteSingleRegister)
+	serv.RegisterFunctionHandler(modbus.FuncCodeWriteMultipleRegisters, WriteMultipleRegisters)
 
 	listenAddr := "0.0.0.0:1502"
 
@@ -369,6 +408,52 @@ func ReadHoldingRegisters(_ *mbserver.Server, frame mbserver.Framer) ([]byte, *m
 
 	log.Printf("Read r:%d, count:%d", register, numRegs)
 	return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(values)...), &mbserver.Success
+}
+
+func WriteSingleRegister(_ *mbserver.Server, frame mbserver.Framer) ([]byte, *mbserver.Exception) {
+	data := frame.GetData()
+	register := int(binary.BigEndian.Uint16(data[0:2]))
+	value := binary.BigEndian.Uint16(data[2:4])
+
+	if registerAccessConfig == nil {
+		return []byte{}, &mbserver.IllegalDataAddress
+	}
+
+	registerAccessConfig.refreshIfNeeded()
+	if !registerAccessConfig.writeRange(modbus.FuncCodeReadHoldingRegisters, register, []uint16{value}) {
+		return []byte{}, &mbserver.IllegalDataAddress
+	}
+
+	log.Printf("Write r:%d, value:%d", register, value)
+	return data, &mbserver.Success
+}
+
+func WriteMultipleRegisters(_ *mbserver.Server, frame mbserver.Framer) ([]byte, *mbserver.Exception) {
+	data := frame.GetData()
+	register := int(binary.BigEndian.Uint16(data[0:2]))
+	numRegs := int(binary.BigEndian.Uint16(data[2:4]))
+	byteCount := int(data[4])
+
+	if byteCount != numRegs*2 {
+		return []byte{}, &mbserver.IllegalDataValue
+	}
+
+	values := make([]uint16, numRegs)
+	for i := 0; i < numRegs; i++ {
+		values[i] = binary.BigEndian.Uint16(data[5+i*2 : 7+i*2])
+	}
+
+	if registerAccessConfig == nil {
+		return []byte{}, &mbserver.IllegalDataAddress
+	}
+
+	registerAccessConfig.refreshIfNeeded()
+	if !registerAccessConfig.writeRange(modbus.FuncCodeReadHoldingRegisters, register, values) {
+		return []byte{}, &mbserver.IllegalDataAddress
+	}
+
+	log.Printf("Write r:%d, count:%d", register, numRegs)
+	return data[0:5], &mbserver.Success
 }
 
 func registerAddressAndNumber(frame mbserver.Framer) (register int, numRegs int, endRegister int) {
