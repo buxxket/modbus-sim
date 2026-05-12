@@ -1,0 +1,17 @@
+{
+  "registers": [
+    { "register": 40100, "type": "uint16", "value": 65280 },
+    { "register": 40101, "type": "int16", "value": -1 },
+    { "register": 40102, "type": "uint16", "value": 0 },
+    { "register": 40300, "type": "uint32", "value": 0 },
+    { "register": 40400, "type": "uint32", "value": 0 },
+    { "register": 40500, "type": "float32", "value": 3.1415927 },
+
+    { "register": 30100, "type": "uint16", "value": 65280 },
+    { "register": 30101, "type": "int16", "value": -1 },
+    { "register": 30102, "type": "uint16", "value": 0 },
+    { "register": 30300, "type": "uint32", "value": 0 },
+    { "register": 30400, "type": "uint32", "value": 0 },
+    { "register": 30500, "type": "float32", "value": 3.1415927 }
+  ]
+}

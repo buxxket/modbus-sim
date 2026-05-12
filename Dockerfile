@@ -33,6 +33,7 @@ WORKDIR /app
 
 # Copy our static executable.
 COPY --from=builder /src/modbus /app/modbus
+COPY --from=builder /src/registers.json /app/registers.json
 
 EXPOSE 1502
 

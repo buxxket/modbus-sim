@@ -2,16 +2,250 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"log"
 	"math"
 	"os"
-	"sync/atomic"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/goburrow/modbus"
 
 	"github.com/tbrandon/mbserver"
 )
+
+const defaultConfigPath = "registers.json"
+
+var registerAccessConfig *configManager
+
+type configuredRegister struct {
+	Register int         `json:"register"`
+	Type     string      `json:"type"`
+	Value    interface{} `json:"value"`
+}
+
+type registerConfig struct {
+	Registers []configuredRegister `json:"registers"`
+}
+
+type configManager struct {
+	path      string
+	mu        sync.RWMutex
+	holding   map[int]uint16
+	input     map[int]uint16
+	modTime   time.Time
+	lastCheck time.Time
+}
+
+func newConfigManager(path string) (*configManager, error) {
+	mgr := &configManager{path: path}
+	if err := mgr.loadConfig(); err != nil {
+		return nil, err
+	}
+	return mgr, nil
+}
+
+func (m *configManager) refreshIfNeeded() {
+	m.mu.RLock()
+	if time.Since(m.lastCheck) < time.Second {
+		m.mu.RUnlock()
+		return
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if time.Since(m.lastCheck) < time.Second {
+		return
+	}
+	m.lastCheck = time.Now()
+
+	stat, err := os.Stat(m.path)
+	if err != nil {
+		log.Printf("Could not stat register config %q: %v", m.path, err)
+		return
+	}
+	if !stat.ModTime().After(m.modTime) {
+		return
+	}
+
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		log.Printf("Could not read register config %q: %v", m.path, err)
+		return
+	}
+
+	var next registerConfig
+	if err := json.Unmarshal(data, &next); err != nil {
+		log.Printf("Could not parse register config %q: %v", m.path, err)
+		return
+	}
+	holding, input, err := buildRegisterMaps(next)
+	if err != nil {
+		log.Printf("Ignoring invalid register config %q: %v", m.path, err)
+		return
+	}
+
+	m.holding = holding
+	m.input = input
+	m.modTime = stat.ModTime()
+	log.Printf("Reloaded register config from %s", m.path)
+}
+
+func (m *configManager) loadConfig() error {
+	stat, err := os.Stat(m.path)
+	if err != nil {
+		return fmt.Errorf("stat register config %q: %w", m.path, err)
+	}
+	data, err := os.ReadFile(m.path)
+	if err != nil {
+		return fmt.Errorf("read register config %q: %w", m.path, err)
+	}
+	var cfg registerConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse register config %q: %w", m.path, err)
+	}
+	holding, input, err := buildRegisterMaps(cfg)
+	if err != nil {
+		return fmt.Errorf("validate register config %q: %w", m.path, err)
+	}
+
+	m.mu.Lock()
+	m.holding = holding
+	m.input = input
+	m.modTime = stat.ModTime()
+	m.lastCheck = time.Now()
+	m.mu.Unlock()
+
+	return nil
+}
+
+func (m *configManager) readRange(function uint8, register int, endRegister int) ([]uint16, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	values := m.holding
+	if function == modbus.FuncCodeReadInputRegisters {
+		values = m.input
+	}
+
+	result := make([]uint16, 0, endRegister-register)
+	for addr := register; addr < endRegister; addr++ {
+		val, ok := values[addr]
+		if !ok {
+			return nil, false
+		}
+		result = append(result, val)
+	}
+	return result, true
+}
+
+func buildRegisterMaps(cfg registerConfig) (map[int]uint16, map[int]uint16, error) {
+	holding := map[int]uint16{}
+	input := map[int]uint16{}
+
+	for i, entry := range cfg.Registers {
+		function, baseAddress, err := resolveRegister(entry.Register)
+		if err != nil {
+			return nil, nil, fmt.Errorf("registers[%d]: %w", i, err)
+		}
+
+		words, err := decodeRegisterWords(entry.Type, entry.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("registers[%d]: %w", i, err)
+		}
+
+		for offset, word := range words {
+			address := baseAddress + offset
+			if address > 65535 {
+				return nil, nil, fmt.Errorf("registers[%d]: mapped address out of range: %d", i, address)
+			}
+			if function == modbus.FuncCodeReadInputRegisters {
+				input[address] = word
+			} else {
+				holding[address] = word
+			}
+		}
+	}
+
+	return holding, input, nil
+}
+
+func resolveRegister(register int) (uint8, int, error) {
+	if register >= 30000 && register <= 39999 {
+		return modbus.FuncCodeReadInputRegisters, register - 30000, nil
+	}
+	if register >= 40000 && register <= 49999 {
+		return modbus.FuncCodeReadHoldingRegisters, register - 40000, nil
+	}
+	return 0, 0, fmt.Errorf("register must be 3xxxx or 4xxxx, got %d", register)
+}
+
+func decodeRegisterWords(typ string, value interface{}) ([]uint16, error) {
+	switch strings.ToLower(strings.TrimSpace(typ)) {
+	case "uint16":
+		n, err := parseIntegerInRange(value, 0, 65535)
+		if err != nil {
+			return nil, fmt.Errorf("uint16 value invalid: %w", err)
+		}
+		return []uint16{uint16(n)}, nil
+	case "int16":
+		n, err := parseIntegerInRange(value, -32768, 32767)
+		if err != nil {
+			return nil, fmt.Errorf("int16 value invalid: %w", err)
+		}
+		return []uint16{uint16(int16(n))}, nil
+	case "uint32":
+		n, err := parseIntegerInRange(value, 0, 4294967295)
+		if err != nil {
+			return nil, fmt.Errorf("uint32 value invalid: %w", err)
+		}
+		u := uint32(n)
+		return []uint16{uint16((u >> 16) & 0xffff), uint16(u & 0xffff)}, nil
+	case "int32":
+		n, err := parseIntegerInRange(value, -2147483648, 2147483647)
+		if err != nil {
+			return nil, fmt.Errorf("int32 value invalid: %w", err)
+		}
+		u := uint32(int32(n))
+		return []uint16{uint16((u >> 16) & 0xffff), uint16(u & 0xffff)}, nil
+	case "float32":
+		f, err := parseFloat(value)
+		if err != nil {
+			return nil, fmt.Errorf("float32 value invalid: %w", err)
+		}
+		bits := math.Float32bits(float32(f))
+		return []uint16{uint16((bits >> 16) & 0xffff), uint16(bits & 0xffff)}, nil
+	default:
+		return nil, fmt.Errorf("unsupported type %q", typ)
+	}
+}
+
+func parseIntegerInRange(value interface{}, min int64, max int64) (int64, error) {
+	n, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("expected a number")
+	}
+	if math.Trunc(n) != n {
+		return 0, fmt.Errorf("expected an integer, got %v", n)
+	}
+	v := int64(n)
+	if v < min || v > max {
+		return 0, fmt.Errorf("must be between %d and %d", min, max)
+	}
+	return v, nil
+}
+
+func parseFloat(value interface{}) (float64, error) {
+	f, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("expected a number")
+	}
+	return f, nil
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -22,45 +256,17 @@ func main() {
 
 func run() error {
 	serv := mbserver.NewServer()
-	startTime := uint32(time.Now().Unix() & 0xffffffff)
-	staMsb := uint16((startTime >> 16) & 0xffff)
-	staLsb := uint16(startTime & 0xffff)
-	log.Printf("msb:%d lsb:%d", staMsb, staLsb)
+	configPath := os.Getenv("REGISTER_CONFIG_PATH")
+	if configPath == "" {
+		configPath = defaultConfigPath
+	}
 
-	serv.HoldingRegisters[100] = 0xff00 // 65280
-	serv.HoldingRegisters[101] = 0xffff // 65535 or -1
-	serv.HoldingRegisters[102] = 0x0000 // 0
-	serv.HoldingRegisters[200] = 0x0000 // "artificially generates error" 201-208,210-211
-	serv.HoldingRegisters[300] = 0x0000 // uptime msb
-	serv.HoldingRegisters[301] = 0x0000 // uptime lsb
-	serv.HoldingRegisters[302] = staMsb // application start time msb
-	serv.HoldingRegisters[303] = staLsb // application start time lsb
-	serv.HoldingRegisters[400] = 0x0000 // unixtime msb
-	serv.HoldingRegisters[401] = 0x0000 // unixtime lsb
-	serv.HoldingRegisters[500] = 0x0000 // math.pi msb
-	serv.HoldingRegisters[501] = 0x0000 // math.pi lsb
-
-	serv.InputRegisters[100] = 0xff00 // 65280
-	serv.InputRegisters[101] = 0xffff // 65535 or -1
-	serv.InputRegisters[102] = 0x0000 // 0
-	serv.InputRegisters[200] = 0x0000 // "artificially generates error" 201-208,210-211
-	serv.InputRegisters[300] = 0x0000 // uptime msb
-	serv.InputRegisters[301] = 0x0000 // uptime lsb
-	serv.InputRegisters[302] = staMsb // application start time msb
-	serv.InputRegisters[303] = staLsb // application start time lsb
-	serv.InputRegisters[400] = 0x0000 // unixtime msb
-	serv.InputRegisters[401] = 0x0000 // unixtime lsb
-	serv.InputRegisters[500] = 0x0000 // math.pi msb
-	serv.InputRegisters[501] = 0x0000 // math.pi lsb
-
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		var uptime uint32 = 0
-		for {
-			<-ticker.C
-			atomic.AddUint32(&uptime, 1)
-		}
-	}()
+	cfgMgr, err := newConfigManager(configPath)
+	if err != nil {
+		return err
+	}
+	registerAccessConfig = cfgMgr
+	log.Printf("Register config loaded from %s", configPath)
 
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadInputRegisters, ReadHoldingRegisters) //note this is a hack
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadHoldingRegisters, ReadHoldingRegisters)
@@ -68,7 +274,7 @@ func run() error {
 	listenAddr := "0.0.0.0:1502"
 
 	log.Printf("Modbus Server listening on %s", listenAddr)
-	err := serv.ListenTCP(listenAddr)
+	err = serv.ListenTCP(listenAddr)
 	if err != nil {
 		return err
 	}
@@ -88,90 +294,25 @@ func run() error {
 //	return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(s.InputRegisters[register:endRegister])...), &mbserver.Success
 //}
 
-func ReadHoldingRegisters(s *mbserver.Server, frame mbserver.Framer) ([]byte, *mbserver.Exception) {
+func ReadHoldingRegisters(_ *mbserver.Server, frame mbserver.Framer) ([]byte, *mbserver.Exception) {
 	register, numRegs, endRegister := registerAddressAndNumber(frame)
+	function := frame.GetFunction()
 	if endRegister > 65536 {
 		return []byte{}, &mbserver.IllegalDataAddress
 	}
-	log.Printf("Read r:%d, count:%d", register, numRegs)
 
-	// get the current unix timestamp, converted as a 32-bit unsigned integer for simplicity
-	unixTs := uint32(time.Now().Unix() & 0xffffffff)
-
-	switch register {
-	//200 "artificially generates error"
-	case 201:
-		return []byte{}, &mbserver.IllegalFunction
-	case 202:
+	if registerAccessConfig == nil {
 		return []byte{}, &mbserver.IllegalDataAddress
-	case 203:
-		return []byte{}, &mbserver.IllegalDataValue
-	case 204:
-		return []byte{}, &mbserver.SlaveDeviceFailure
-	case 205:
-		return []byte{}, &mbserver.AcknowledgeSlave
-	case 206:
-		return []byte{}, &mbserver.SlaveDeviceBusy
-	case 207:
-		return []byte{}, &mbserver.NegativeAcknowledge
-	case 208:
-		return []byte{}, &mbserver.MemoryParityError
-	case 210:
-		return []byte{}, &mbserver.GatewayPathUnavailable
-	case 211:
-		return []byte{}, &mbserver.GatewayTargetDeviceFailedtoRespond
-
-	//300 uptime msb
-	//301 uptime lsb
-	case 300:
-		fallthrough
-	case 301:
-		if numRegs > 2 {
-			return []byte{}, &mbserver.IllegalDataAddress
-		}
-		time32 := uint32(time.Now().Unix() & 0xffffffff)
-
-		staMsb := s.HoldingRegisters[302] // application start time msb
-		staLsb := s.HoldingRegisters[303] // application start time lsb
-		startTime := uint32(staMsb)<<16 + uint32(staLsb)
-
-		uptime := time32 - startTime
-
-		msb := uint16((uptime >> 16) & 0xffff)
-		lsb := uint16(uptime & 0xffff)
-		bits := []uint16{msb, lsb}
-		return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(bits[register-300:endRegister-300])...), &mbserver.Success
-
-	//400 unixtime msb
-	//401 unixtime lsb
-	case 400:
-		fallthrough
-	case 401:
-		startingAddress := 400
-		if numRegs > 2 {
-			return []byte{}, &mbserver.IllegalDataAddress
-		}
-		msb := uint16((unixTs >> 16) & 0xffff)
-		lsb := uint16(unixTs & 0xffff)
-		bits := []uint16{msb, lsb}
-		return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(bits[register-startingAddress:endRegister-startingAddress])...), &mbserver.Success
-
-	//500 math.pi msb
-	case 500:
-		fallthrough
-	//501 math.pi lsb
-	case 501:
-		startingAddress := 500
-		if numRegs > 2 {
-			return []byte{}, &mbserver.IllegalDataAddress
-		}
-		pi32 := math.Float32bits(math.Pi)
-		msb := uint16((pi32 >> 16) & 0xffff)
-		lsb := uint16(pi32 & 0xffff)
-		bits := []uint16{msb, lsb}
-		return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(bits[register-startingAddress:endRegister-startingAddress])...), &mbserver.Success
 	}
-	return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(s.HoldingRegisters[register:endRegister])...), &mbserver.Success
+
+	registerAccessConfig.refreshIfNeeded()
+	values, ok := registerAccessConfig.readRange(function, register, endRegister)
+	if !ok {
+		return []byte{}, &mbserver.IllegalDataAddress
+	}
+
+	log.Printf("Read r:%d, count:%d", register, numRegs)
+	return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(values)...), &mbserver.Success
 }
 
 func registerAddressAndNumber(frame mbserver.Framer) (register int, numRegs int, endRegister int) {

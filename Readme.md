@@ -3,63 +3,7 @@
 
 A simple modbus/tcp server based on the modbus server implementation from github.com/tbrandon/mbserver
 
-The Holding Registers and Input Registers are defined as follows:
-
-### Holding Registers
-
-To read Holding Register `100` use `400100`
-
-| Address | Description |
-| :-----: | ----------- |
-| 100     | 0xff00 ie. 65280 |
-| 101     | 0xffff ie. 65535 or -1 |
-| 102     | 0x0000 ie. 0 |
-| 201     | artificially generates error: IllegalFunction |
-| 202     | artificially generates error: IllegalDataAddress |
-| 203     | artificially generates error: IllegalDataValue |
-| 204     | artificially generates error: SlaveDeviceFailure |
-| 205     | artificially generates error: AcknowledgeSlave |
-| 206     | artificially generates error: SlaveDeviceBusy |
-| 207     | artificially generates error: NegativeAcknowledge |
-| 208     | artificially generates error: MemoryParityError |
-| 210     | artificially generates error: GatewayPathUnavailable |
-| 211     | artificially generates error: GatewayTargetDeviceFailedtoRespond |
-| 300     | uptime msb |
-| 301     | uptime lsb |
-| 302     | application start time msb |
-| 303     | application start time lsb |
-| 400     | unixtime msb |
-| 401     | unixtime lsb |
-| 500     | math.pi msb |
-| 501     | math.pi lsb |
-
-### Input Registers
-
-To read Input Register `100` use `300100`
-
-| Address | Description |
-| :-----: | ----------- |
-| 100     | 0xff00 ie. 65280 |
-| 101     | 0xffff ie. 65535 or -1 |
-| 102     | 0x0000 ie. 0 |
-| 201     | artificially generates error: IllegalFunction |
-| 202     | artificially generates error: IllegalDataAddress |
-| 203     | artificially generates error: IllegalDataValue |
-| 204     | artificially generates error: SlaveDeviceFailure |
-| 205     | artificially generates error: AcknowledgeSlave |
-| 206     | artificially generates error: SlaveDeviceBusy |
-| 207     | artificially generates error: NegativeAcknowledge |
-| 208     | artificially generates error: MemoryParityError |
-| 210     | artificially generates error: GatewayPathUnavailable |
-| 211     | artificially generates error: GatewayTargetDeviceFailedtoRespond |
-| 300     | uptime msb |
-| 301     | uptime lsb |
-| 302     | application start time msb |
-| 303     | application start time lsb |
-| 400     | unixtime msb |
-| 401     | unixtime lsb |
-| 500     | math.pi msb |
-| 501     | math.pi lsb |
+Register exposure and values are fully configuration-driven via [registers.json](registers.json).
 
 ## Supported Architectures
 Simply pulling `techplex/modbus-sim:latest` should retrieve the correct image for your arch.
@@ -74,6 +18,40 @@ The architectures supported by this image are:
 
 ## Application Setup
 The application can be accessed at tcp://yourhost:1502
+
+## Register Exposure Configuration
+
+The simulator reads register definitions from [registers.json](registers.json) at startup.
+
+You can change which registers are exposed while the simulator is running by editing [registers.json](registers.json). The server checks for file changes and automatically reloads the configuration (up to once per second).
+
+When a requested register is not exposed by config, the simulator responds with `IllegalDataAddress`.
+
+### Config format
+
+```json
+{
+  "registers": [
+    { "register": 40100, "type": "uint16", "value": 65280 },
+    { "register": 30100, "type": "uint16", "value": 65280 },
+    { "register": 40500, "type": "float32", "value": 3.1415927 }
+  ]
+}
+```
+
+- `register` is the complete Modbus register number (for example `40100` or `30100`).
+- `type` supports: `uint16`, `int16`, `uint32`, `int32`, `float32`.
+- `value` is encoded according to `type`.
+- `uint32`, `int32`, and `float32` consume two register words starting at `register`.
+- Requests that span any register outside configured entries are rejected.
+
+### Optional config path override
+
+Set `REGISTER_CONFIG_PATH` to load config from a different file:
+
+```bash
+REGISTER_CONFIG_PATH=/path/to/registers.json ./modbus-sim
+```
 
 ## Usage
 Here are some example snippets to help you get started creating a container.
