@@ -27,7 +27,9 @@ type configuredRegister struct {
 }
 
 type registerConfig struct {
-	Registers []configuredRegister `json:"registers"`
+	Registers        []configuredRegister `json:"registers"`
+	HoldingRegisters []configuredRegister `json:"holding_registers"`
+	InputRegisters   []configuredRegister `json:"input_registers"`
 }
 
 type configManager struct {
@@ -171,7 +173,61 @@ func buildRegisterMaps(cfg registerConfig) (map[int]uint16, map[int]uint16, erro
 		}
 	}
 
+	for i, entry := range cfg.HoldingRegisters {
+		baseAddress, err := resolveScopedRegister(entry.Register, modbus.FuncCodeReadHoldingRegisters)
+		if err != nil {
+			return nil, nil, fmt.Errorf("holding_registers[%d]: %w", i, err)
+		}
+
+		words, err := decodeRegisterWords(entry.Type, entry.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("holding_registers[%d]: %w", i, err)
+		}
+
+		for offset, word := range words {
+			address := baseAddress + offset
+			if address > 65535 {
+				return nil, nil, fmt.Errorf("holding_registers[%d]: mapped address out of range: %d", i, address)
+			}
+			holding[address] = word
+		}
+	}
+
+	for i, entry := range cfg.InputRegisters {
+		baseAddress, err := resolveScopedRegister(entry.Register, modbus.FuncCodeReadInputRegisters)
+		if err != nil {
+			return nil, nil, fmt.Errorf("input_registers[%d]: %w", i, err)
+		}
+
+		words, err := decodeRegisterWords(entry.Type, entry.Value)
+		if err != nil {
+			return nil, nil, fmt.Errorf("input_registers[%d]: %w", i, err)
+		}
+
+		for offset, word := range words {
+			address := baseAddress + offset
+			if address > 65535 {
+				return nil, nil, fmt.Errorf("input_registers[%d]: mapped address out of range: %d", i, address)
+			}
+			input[address] = word
+		}
+	}
+
 	return holding, input, nil
+}
+
+func resolveScopedRegister(register int, function uint8) (int, error) {
+	if function == modbus.FuncCodeReadInputRegisters {
+		if register >= 30000 && register <= 39999 {
+			return register - 30000, nil
+		}
+		return 0, fmt.Errorf("register must be full notation 3xxxx for input, got %d", register)
+	}
+
+	if register >= 40000 && register <= 49999 {
+		return register - 40000, nil
+	}
+	return 0, fmt.Errorf("register must be full notation 4xxxx for holding, got %d", register)
 }
 
 func resolveRegister(register int) (uint8, int, error) {

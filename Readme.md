@@ -31,19 +31,27 @@ When a requested register is not exposed by config, the simulator responds with 
 
 ```json
 {
-  "registers": [
+  "holding_registers": [
     { "register": 40100, "type": "uint16", "value": 65280 },
-    { "register": 30100, "type": "uint16", "value": 65280 },
     { "register": 40500, "type": "float32", "value": 3.1415927 }
+  ],
+  "input_registers": [
+    { "register": 30100, "type": "uint16", "value": 65280 },
+    { "register": 30101, "type": "uint16", "value": 123 }
   ]
 }
 ```
 
-- `register` is the complete Modbus register number (for example `40100` or `30100`).
+- `holding_registers` and `input_registers` are separate blocks for each register type.
+- In these blocks, `register` must use full notation (`4xxxx` for holding, `3xxxx` for input).
 - `type` supports: `uint16`, `int16`, `uint32`, `int32`, `float32`.
 - `value` is encoded according to `type`.
 - `uint32`, `int32`, and `float32` consume two register words starting at `register`.
 - Requests that span any register outside configured entries are rejected.
+
+Backward compatibility:
+- A flat `registers` array is still supported.
+- In `registers`, use full notation (`3xxxx` or `4xxxx`) to indicate register type.
 
 ### Optional config path override
 
