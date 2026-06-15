@@ -320,17 +320,18 @@ func buildRegisterMaps(cfg registerConfig) (map[int]uint16, map[int]uint16, erro
 }
 
 func resolveScopedRegister(register int, function uint8) (int, error) {
-	if function == modbus.FuncCodeReadInputRegisters {
-		if register >= 30000 && register <= 39999 {
-			return register, nil
-		}
-		return 0, fmt.Errorf("register must be full notation 3xxxx for input, got %d", register)
-	}
-
-	if register >= 40000 && register <= 49999 {
-		return register, nil
-	}
-	return 0, fmt.Errorf("register must be full notation 4xxxx for holding, got %d", register)
+	// if function == modbus.FuncCodeReadInputRegisters {
+	// 	if register >= 30000 && register <= 39999 {
+	// 		return register, nil
+	// 	}
+	// 	return 0, fmt.Errorf("register must be full notation 3xxxx for input, got %d", register)
+	// }
+	//
+	// if register >= 40000 && register <= 49999 {
+	// 	return register, nil
+	// }
+	// return 0, fmt.Errorf("register must be full notation 4xxxx for holding, got %d", register)
+	return register, nil
 }
 
 func resolveRegister(register int) (uint8, int, error) {
