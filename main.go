@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"math"
 	"os"
@@ -19,6 +21,48 @@ import (
 const defaultConfigPath = "registers.json"
 
 var registerAccessConfig *configManager
+var currentLogMode = logModeNormal
+
+type logMode int
+
+const (
+	logModeQuiet logMode = iota
+	logModeNormal
+	logModeVerbose
+)
+
+func (m logMode) enabled(min logMode) bool {
+	return m >= min
+}
+
+func parseLogMode(value string) (logMode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "quiet":
+		return logModeQuiet, nil
+	case "normal":
+		return logModeNormal, nil
+	case "verbose":
+		return logModeVerbose, nil
+	default:
+		return logModeNormal, fmt.Errorf("invalid -log-mode %q (valid: quiet, normal, verbose)", value)
+	}
+}
+
+type appOptions struct {
+	logMode logMode
+}
+
+func parseOptions() (appOptions, error) {
+	modeArg := flag.String("log-mode", "normal", "Logging mode: quiet, normal, verbose")
+	flag.Parse()
+
+	mode, err := parseLogMode(*modeArg)
+	if err != nil {
+		return appOptions{}, err
+	}
+
+	return appOptions{logMode: mode}, nil
+}
 
 type configuredRegister struct {
 	Register int         `json:"register"`
@@ -33,14 +77,16 @@ type registerConfig struct {
 }
 
 type configManager struct {
-	path           string
-	mu             sync.RWMutex
-	holding        map[int]uint16
-	input          map[int]uint16
+	path      string
+	mu        sync.RWMutex
+	holding   map[int]uint16
+	input     map[int]uint16
 	writtenHolding map[int]uint16
 	writtenInput   map[int]uint16
-	modTime        time.Time
-	lastCheck      time.Time
+	modTime   time.Time
+	lastHash  uint64
+	heartbeat time.Time
+	lastCheck time.Time
 }
 
 func newConfigManager(path string) (*configManager, error) {
@@ -71,38 +117,50 @@ func (m *configManager) refreshIfNeeded() {
 	}
 	m.lastCheck = time.Now()
 
-	stat, err := os.Stat(m.path)
-	if err != nil {
-		log.Printf("Could not stat register config %q: %v", m.path, err)
-		return
-	}
-	if !stat.ModTime().After(m.modTime) {
-		return
-	}
-
 	data, err := os.ReadFile(m.path)
 	if err != nil {
 		log.Printf("Could not read register config %q: %v", m.path, err)
 		return
 	}
 
+	newHash := configHash(data)
+	if newHash == m.lastHash {
+		if currentLogMode.enabled(logModeVerbose) && time.Since(m.heartbeat) >= 10*time.Second {
+			m.heartbeat = time.Now()
+			log.Printf("Config watcher active for %s (hash=%016x)", m.path, newHash)
+		}
+		return
+	}
+	oldHash := m.lastHash
+	if currentLogMode.enabled(logModeNormal) {
+		log.Printf("Detected register config change for %s: hash %016x -> %016x", m.path, oldHash, newHash)
+	}
+
 	var next registerConfig
 	if err := json.Unmarshal(data, &next); err != nil {
-		log.Printf("Could not parse register config %q: %v", m.path, err)
+		m.lastHash = newHash
+		log.Printf("Could not parse register config %q: %v (keeping previous register map)", m.path, err)
 		return
 	}
 	holding, input, err := buildRegisterMaps(next)
 	if err != nil {
-		log.Printf("Ignoring invalid register config %q: %v", m.path, err)
+		m.lastHash = newHash
+		log.Printf("Ignoring invalid register config %q: %v (keeping previous register map)", m.path, err)
 		return
 	}
 
+	if stat, statErr := os.Stat(m.path); statErr == nil {
+		m.modTime = stat.ModTime()
+	}
 	m.holding = holding
 	m.input = input
 	m.writtenHolding = make(map[int]uint16)
 	m.writtenInput = make(map[int]uint16)
-	m.modTime = stat.ModTime()
-	log.Printf("Reloaded register config from %s", m.path)
+	m.lastHash = newHash
+	m.heartbeat = time.Now()
+	if currentLogMode.enabled(logModeNormal) {
+		log.Printf("Reloaded register config from %s", m.path)
+	}
 }
 
 func (m *configManager) loadConfig() error {
@@ -129,10 +187,18 @@ func (m *configManager) loadConfig() error {
 	m.writtenHolding = make(map[int]uint16)
 	m.writtenInput = make(map[int]uint16)
 	m.modTime = stat.ModTime()
+	m.lastHash = configHash(data)
+	m.heartbeat = time.Now()
 	m.lastCheck = time.Now()
 	m.mu.Unlock()
 
 	return nil
+}
+
+func configHash(data []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(data)
+	return h.Sum64()
 }
 
 func (m *configManager) readRange(function uint8, register int, endRegister int) ([]uint16, bool) {
@@ -154,7 +220,7 @@ func (m *configManager) readRange(function uint8, register int, endRegister int)
 			val, ok = config[addr]
 		}
 		if !ok {
-			return nil, false
+			val = 0
 		}
 		result = append(result, val)
 	}
@@ -341,13 +407,21 @@ func parseFloat(value interface{}) (float64, error) {
 }
 
 func main() {
-	if err := run(); err != nil {
+	opts, err := parseOptions()
+	if err != nil {
+		log.Printf("Error: %s", err)
+		os.Exit(2)
+	}
+
+	if err := run(opts); err != nil {
 		log.Printf("Error: %s", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+func run(opts appOptions) error {
+	currentLogMode = opts.logMode
+
 	serv := mbserver.NewServer()
 	configPath := os.Getenv("REGISTER_CONFIG_PATH")
 	if configPath == "" {
@@ -359,24 +433,29 @@ func run() error {
 		return err
 	}
 	registerAccessConfig = cfgMgr
-	log.Printf("Register config loaded from %s", configPath)
+	if currentLogMode.enabled(logModeNormal) {
+		log.Printf("Register config loaded from %s", configPath)
+	}
 
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadInputRegisters, ReadHoldingRegisters) //note this is a hack
 	serv.RegisterFunctionHandler(modbus.FuncCodeReadHoldingRegisters, ReadHoldingRegisters)
 	serv.RegisterFunctionHandler(modbus.FuncCodeWriteSingleRegister, WriteSingleRegister)
 	serv.RegisterFunctionHandler(modbus.FuncCodeWriteMultipleRegisters, WriteMultipleRegisters)
 
-	listenAddr := "0.0.0.0:1502"
+	listenAddr := "0.0.0.0:502"
 
-	log.Printf("Modbus Server listening on %s", listenAddr)
+	if currentLogMode.enabled(logModeNormal) {
+		log.Printf("Modbus Server listening on %s", listenAddr)
+	}
 	err = serv.ListenTCP(listenAddr)
 	if err != nil {
 		return err
 	}
 	defer serv.Close()
 
-	// Wait forever
+	// Keep config hot-reload checks active even when clients are idle.
 	for {
+		cfgMgr.refreshIfNeeded()
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -406,7 +485,9 @@ func ReadHoldingRegisters(_ *mbserver.Server, frame mbserver.Framer) ([]byte, *m
 		return []byte{}, &mbserver.IllegalDataAddress
 	}
 
-	log.Printf("Read r:%d, count:%d", register, numRegs)
+	if currentLogMode.enabled(logModeVerbose) {
+		log.Printf("Read r:%d, count:%d", register, numRegs)
+	}
 	return append([]byte{byte(numRegs * 2)}, mbserver.Uint16ToBytes(values)...), &mbserver.Success
 }
 

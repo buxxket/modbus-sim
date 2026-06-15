@@ -1,0 +1,20 @@
+services:
+  modbus-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: modbus-sim:local
+    container_name: modbus-sim
+    command: ["/app/modbus", "-log-mode=${MODBUS_LOG_MODE:-normal}"]
+    restart: unless-stopped
+    environment:
+      REGISTER_CONFIG_PATH: /config/registers.json
+    ports:
+      - "502:502"
+    volumes:
+      - ./:/config:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

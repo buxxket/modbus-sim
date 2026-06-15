@@ -35,6 +35,6 @@ WORKDIR /app
 COPY --from=builder /src/modbus /app/modbus
 COPY --from=builder /src/registers.json /app/registers.json
 
-EXPOSE 1502
+EXPOSE 502
 
 ENTRYPOINT ["/app/modbus"]
